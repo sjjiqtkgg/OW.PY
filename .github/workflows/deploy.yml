@@ -8,6 +8,10 @@ on:
 jobs:
   run-task:
     runs-on: ubuntu-latest
+    
+    # 👇 关键修改：添加以下两行，授予工作流写入权限
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository code
