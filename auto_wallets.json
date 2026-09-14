@@ -1,0 +1,17 @@
+[
+  {
+    "address": "0x2146b9e319b581a006e876d7fd32345e38dcc71b",
+    "user_id": "usr_1e98a6550f238b21d89fb040",
+    "plan_id": "trial"
+  },
+  {
+    "address": "0x432183d2d8259bd555fc6608da4300d2441544f2",
+    "user_id": "usr_e64832565c96f442115befac",
+    "plan_id": "trial"
+  },
+  {
+    "address": "0x26626a1c993d5418be2d7dd10c818aed5a45c0f3",
+    "user_id": "usr_616136fc21deb973a5f0bf9c",
+    "plan_id": "trial"
+  }
+]
