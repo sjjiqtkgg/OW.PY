@@ -1,17 +1,7 @@
 [
   {
-    "address": "0x52030043c7c82a3d3bd5d7180871dd9557123e1d",
-    "user_id": "usr_deebeeec51f97a55979fbb2e",
-    "plan_id": "trial"
-  },
-  {
-    "address": "0x161f95fdf99dc154ea1d9d6e832515fa35bd18ea",
-    "user_id": "usr_89b4f01206260485bd7363c9",
-    "plan_id": "trial"
-  },
-  {
-    "address": "0xee140cecd4df6ffbe73518de0fdf6a8643c8489e",
-    "user_id": "usr_89de3b6858363fdd5213689c",
+    "address": "0x12402784ee844724ee303f382af84715ecd21a2d",
+    "user_id": "usr_3d855b16b7a2072053f9d39a",
     "plan_id": "trial"
   }
 ]
