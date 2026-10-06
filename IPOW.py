@@ -1,41 +1,29 @@
 #!/usr/bin/env python3
-"""iPoW.ai 安卓专版 (全量57节点 + 双协议拆分：自动注册钱包 + 429换号续传)
+"""iPoW.ai 全自动实时真实 IP 拉取脚本 (Android Termux 纯标准库专用版)
 
-【专为 Android (Termux) 深度定制】
-1. **100% 纯 Python 3 标准库实现**：
-   - 零外部依赖！无需 `pip install`，无需编译 Rust，无需 C 编译器（clang/gcc）。
-   - 内置纯 Python Keccak-256、Secp256k1 椭圆曲线签名、AES-256-GCM 解密与 urllib 网络请求。
-   - 手机只要装了 Termux + Python (`pkg install python`)，单文件拷贝进去直接跑！
-2. **完整自动化流程**：
-   - 自动获取全量节点目录 `/v1/nodes`（全网 57 个物理节点 / 26 国，默认只取在线）；
-   - 每个物理节点自动拆分双协议出站：标准 `vless-reality`（xtls-rprx-vision 流控）
-     + 移动端 `vless-reality:no-flow`，一条节点生成两条可导入配置；
-   - **订阅快速路径（默认）**：GET `sub.ipow.ai/sub/<token>?session_id=&country=`
-     一次请求拿到该国全部节点（实测 23 国 47 节点 ≈ 30s，免逐节点 capability、
-     不耗配额），并附带每个节点的 **hysteria2** 出站；失败自动回退逐节点拉取；
-   - 自动生成 Web3 钱包并完成 SIWE 注册与会话建立；
-   - 逐个拉取并解密 VLESS-Reality 节点；
-   - 遇到 HTTP 429 限流或 402 配额耗尽时，**自动光速注册新钱包并无缝续传**；
-   - 自动智能跳过不可用死节点，避免换号后死循环；
-3. **输出配置文件**（支持一键导入安卓各代理客户端）：
-   - `all_nodes_vless.txt`：每行一条标准 vless:// 链接，直接批量复制导入 **v2rayNG** / **Shadowrocket**；
-   - `all_nodes_hy2.txt`：hysteria2:// 链接（订阅路径拉到时生成）；
-   - `clash_proxies.yaml`：Clash Meta / Mihomo 格式，导入 **Clash Verge** / **Clash Meta for Android**；
-   - `singbox_outbounds.json`：Sing-box 出站配置；
-   - `all_nodes.json`：节点全量元数据。
-
-【无命令行参数版】
-所有可调项集中在本文件顶部的 `CONFIG` 字典，需要修改直接改那里即可。
-
-用法示例：
-    python auto_register_android.py
+【核心设计原则：100% 动态实时获取，绝无任何硬编码 IP】
+1. **零内置静态 IP 字典**：不依赖任何硬编码 IP，官方换一万次 IP 也绝不失效。
+2. **双轨实时真 IP 获取**：
+   - VLESS-Reality：调用官方 DHT 接口 `/p2p-lite/v2/dht/capability`，
+     纯 Python 实时解密 `encrypted_profile`，获取官方当下真实的物理落地 IP！
+   - Hysteria2：从官方订阅数据 `sub.ipow.ai` 中实时提取当前物理落地 IP，
+     并自动纠偏 SNI，符合 RFC 规范。
+3. **100% 纯 Python 3 标准库（零依赖）**：
+   - 内置纯 Python Keccak-256、Secp256k1 椭圆曲线签名、AES-256-GCM 解密引擎。
+   - 手机 Termux 仅需 `pkg install python`，单文件拷入即跑，免 pip / 免 Rust / 免 C 编译！
+4. **429 限流全自动换号续传**：
+   - 逐节点拉取撞到 429 限流时，0.5 秒内自动生成新 Web3 钱包并无缝接力。
+5. **安卓目录直通**：
+   - 自动识别并保存到 `/sdcard/Download`，方便直接在 v2rayNG / Clash Meta 中导入。
 """
 
+import argparse
 import base64
 import json
 import os
 import random
 import re
+import socket
 import ssl
 import sys
 import time
@@ -43,8 +31,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, 'reconfigure'):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
-# 可选硬件加速检测（若装了库自动启用加速，若没装则完全走内置纯 Python 引擎）
+# 可选硬件加速检测（若系统装了库则加速，没装则 100% 走纯 Python 内置引擎）
 # ---------------------------------------------------------------------------
 try:
     import requests
@@ -66,34 +61,18 @@ except ImportError:
     _HAS_CRYPTOGRAPHY = False
 
 # ---------------------------------------------------------------------------
-# 固定运行配置（原命令行参数已移除，需要修改直接改这里）
-# ---------------------------------------------------------------------------
-CONFIG = {
-    'interval': 2.0,            # 每次请求间隔秒数
-    'wallets': 10,              # 最多使用多少个钱包
-    'limit': None,              # 限制总拉取节点数（None = 全部）
-    'include_offline': False,   # 是否包含 status=offline 的节点
-    'via': 'auto',              # 拉取途径: auto=订阅优先失败回退, sub=仅订阅, capability=旧版逐节点
-    'batch_size': 62,           # 每个钱包拉取的最大节点数
-    'base_url': 'https://ipow.ai',
-    'out_dir': None,            # None = 自动使用系统下载目录
-    'verbose': False,           # 详细输出
-    'quiet': False,             # 只输出最终结果
-}
-
-# ---------------------------------------------------------------------------
 # 常量配置
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_BASE = 'https://ipow.ai'
 USER_AGENT = 'Dart/3.10 (dart:io)'
-SUB_USER_AGENT = 'ClashforWindows/0.19.23'   # 订阅端点实测可用的 UA
+SUB_USER_AGENT = 'ClashforWindows/0.19.23'
 CLIENT_TYPE = 'android'
 CLIENT_VERSION = '4.3.4'
 CAPABILITY = 'vless-reality:no-flow'
-CATALOG_PATH = '/v1/nodes'          # 全量节点目录（57 个物理节点，非 p2p-lite 的 24 个推荐子集）
+CATALOG_PATH = '/v1/nodes'
 FLOW_VISION = 'xtls-rprx-vision'
-# 双协议出站拆分：(协议, flow, 节点名后缀)
+
 PROTOCOL_VARIANTS = (
     ('vless-reality', FLOW_VISION, '-reality'),
     ('vless-reality:no-flow', '', '-noflow'),
@@ -102,6 +81,74 @@ DEFAULT_SNI = 'www.cloudflare.com'
 DEFAULT_FINGERPRINT = 'chrome'
 MERGED_NODES_FILE = 'all_nodes.json'
 WALLETS_FILE = 'auto_wallets.json'
+IP_MAP_FILE = 'node_ip_map.json'
+
+# 内置全量 62 个已知物理节点（单文件独立运行，无需外部 json）
+KNOWN_PHYSICAL_NODES = [
+    {"id": "gcp-australia-southeast1-1", "country_code": "AU", "country": "Australia", "city": "australia-southeast1-a", "status": "online"},
+    {"id": "gcp-australia-southeast1-2", "country_code": "AU", "country": "Australia", "city": "australia-southeast1-b", "status": "online"},
+    {"id": "gcp-europe-west1-1", "country_code": "BE", "country": "Belgium", "city": "Brussels", "status": "online"},
+    {"id": "gcp-europe-west1-2", "country_code": "BE", "country": "Belgium", "city": "Brussels", "status": "online"},
+    {"id": "gcp-europe-west1-be-1", "country_code": "BE", "country": "Belgium", "city": "europe-west1-b", "status": "online"},
+    {"id": "gcp-europe-west1-be-2", "country_code": "BE", "country": "Belgium", "city": "europe-west1-c", "status": "online"},
+    {"id": "gcp-southamerica-east1-1", "country_code": "BR", "country": "Brazil", "city": "southamerica-east1-a", "status": "online"},
+    {"id": "gcp-southamerica-east1-2", "country_code": "BR", "country": "Brazil", "city": "southamerica-east1-a", "status": "online"},
+    {"id": "gcp-northamerica-northeast1-1", "country_code": "CA", "country": "Canada", "city": "northamerica-northeast1-a", "status": "online"},
+    {"id": "gcp-northamerica-northeast1-2", "country_code": "CA", "country": "Canada", "city": "northamerica-northeast1-b", "status": "online"},
+    {"id": "gcp-europe-west6-1", "country_code": "CH", "country": "Switzerland", "city": "europe-west6-a", "status": "online"},
+    {"id": "gcp-europe-west6-2", "country_code": "CH", "country": "Switzerland", "city": "europe-west6-b", "status": "online"},
+    {"id": "gcp-southamerica-west1-cl-1", "country_code": "CL", "country": "Chile", "city": "southamerica-west1-a", "status": "online"},
+    {"id": "gcp-southamerica-west1-cl-2", "country_code": "CL", "country": "Chile", "city": "southamerica-west1-b", "status": "online"},
+    {"id": "gcp-europe-west3-1", "country_code": "DE", "country": "Germany", "city": "europe-west3-b", "status": "online"},
+    {"id": "gcp-europe-west3-2", "country_code": "DE", "country": "Germany", "city": "europe-west3-c", "status": "online"},
+    {"id": "gcp-europe-southwest1-es-1", "country_code": "ES", "country": "Spain", "city": "europe-southwest1-a", "status": "online"},
+    {"id": "gcp-europe-southwest1-es-2", "country_code": "ES", "country": "Spain", "city": "europe-southwest1-b", "status": "online"},
+    {"id": "gcp-europe-north1-fi-1", "country_code": "FI", "country": "Finland", "city": "europe-north1-a", "status": "online"},
+    {"id": "gcp-europe-north1-fi-2", "country_code": "FI", "country": "Finland", "city": "europe-north1-b", "status": "online"},
+    {"id": "gcp-europe-west9-1", "country_code": "FR", "country": "France", "city": "europe-west9-b", "status": "online"},
+    {"id": "gcp-europe-west9-2", "country_code": "FR", "country": "France", "city": "europe-west9-b", "status": "online"},
+    {"id": "gcp-europe-west2-1", "country_code": "GB", "country": "United Kingdom", "city": "europe-west2-b", "status": "online"},
+    {"id": "gcp-europe-west2-2", "country_code": "GB", "country": "United Kingdom", "city": "europe-west2-a", "status": "online"},
+    {"id": "gcp-asia-east2-1", "country_code": "HK", "country": "Hong Kong", "city": "asia-east2-a", "status": "online"},
+    {"id": "gcp-asia-east2-2", "country_code": "HK", "country": "Hong Kong", "city": "asia-east2-b", "status": "online"},
+    {"id": "gcp-asia-southeast2-1", "country_code": "ID", "country": "Indonesia", "city": "asia-southeast2-a", "status": "online"},
+    {"id": "gcp-asia-southeast2-2", "country_code": "ID", "country": "Indonesia", "city": "asia-southeast2-b", "status": "online"},
+    {"id": "gcp-me-west1-il-1", "country_code": "IL", "country": "Israel", "city": "me-west1-a", "status": "online"},
+    {"id": "gcp-me-west1-il-2", "country_code": "IL", "country": "Israel", "city": "me-west1-b", "status": "online"},
+    {"id": "gcp-asia-south1-1", "country_code": "IN", "country": "India", "city": "asia-south1-b", "status": "online"},
+    {"id": "gcp-asia-south1-2", "country_code": "IN", "country": "India", "city": "asia-south1-c", "status": "online"},
+    {"id": "gcp-europe-west8-it-1", "country_code": "IT", "country": "Italy", "city": "europe-west8-a", "status": "online"},
+    {"id": "gcp-europe-west8-it-2", "country_code": "IT", "country": "Italy", "city": "europe-west8-b", "status": "online"},
+    {"id": "gcp-asia-northeast1-1", "country_code": "JP", "country": "Japan", "city": "asia-northeast1-b", "status": "online"},
+    {"id": "gcp-asia-northeast1-2", "country_code": "JP", "country": "Japan", "city": "asia-northeast1-c", "status": "online"},
+    {"id": "gcp-asia-northeast3-1", "country_code": "KR", "country": "South Korea", "city": "asia-northeast3-a", "status": "online"},
+    {"id": "gcp-asia-northeast3-2", "country_code": "KR", "country": "South Korea", "city": "asia-northeast3-b", "status": "online"},
+    {"id": "gcp-northamerica-south1-mx-1", "country_code": "MX", "country": "Mexico", "city": "northamerica-south1-a", "status": "online"},
+    {"id": "gcp-northamerica-south1-mx-2", "country_code": "MX", "country": "Mexico", "city": "northamerica-south1-b", "status": "online"},
+    {"id": "gcp-europe-west4-1", "country_code": "NL", "country": "Netherlands", "city": "europe-west4-a", "status": "online"},
+    {"id": "gcp-europe-west4-2", "country_code": "NL", "country": "Netherlands", "city": "europe-west4-b", "status": "online"},
+    {"id": "gcp-europe-central2-pl-1", "country_code": "PL", "country": "Poland", "city": "Warsaw", "status": "online"},
+    {"id": "gcp-europe-central2-pl-2", "country_code": "PL", "country": "Poland", "city": "Warsaw", "status": "online"},
+    {"id": "gcp-me-central1-1", "country_code": "QA", "country": "Qatar", "city": "me-central1-a", "status": "online"},
+    {"id": "gcp-me-central1-2", "country_code": "QA", "country": "Qatar", "city": "me-central1-b", "status": "online"},
+    {"id": "gcp-europe-north2-1", "country_code": "SE", "country": "Sweden", "city": "europe-north2-b", "status": "online"},
+    {"id": "gcp-europe-north2-2", "country_code": "SE", "country": "Sweden", "city": "europe-north2-c", "status": "online"},
+    {"id": "gcp-asia-southeast1-1", "country_code": "SG", "country": "Singapore", "city": "Singapore", "status": "online"},
+    {"id": "gcp-asia-southeast1-2", "country_code": "SG", "country": "Singapore", "city": "asia-southeast1-c", "status": "online"},
+    {"id": "gcp-asia-southeast3-1", "country_code": "TH", "country": "Thailand", "city": "asia-southeast3-a", "status": "online"},
+    {"id": "gcp-asia-southeast3-2", "country_code": "TH", "country": "Thailand", "city": "asia-southeast3-b", "status": "online"},
+    {"id": "gcp-asia-east1-1", "country_code": "TW", "country": "Taiwan", "city": "asia-east1-a", "status": "online"},
+    {"id": "gcp-asia-east1-2", "country_code": "TW", "country": "Taiwan", "city": "asia-east1-b", "status": "online"},
+    {"id": "gcp-us-central1-1", "country_code": "US", "country": "United States", "city": "Council Bluffs", "status": "online"},
+    {"id": "gcp-us-central1-2", "country_code": "US", "country": "United States", "city": "Council Bluffs", "status": "online"},
+    {"id": "gcp-us-east4-1", "country_code": "US", "country": "United States", "city": "us-east4-b", "status": "online"},
+    {"id": "gcp-us-east4-2", "country_code": "US", "country": "United States", "city": "us-east4-c", "status": "online"},
+    {"id": "gcp-us-west1-1", "country_code": "US", "country": "United States", "city": "us-west1-b", "status": "online"},
+    {"id": "gcp-us-west1-2", "country_code": "US", "country": "United States", "city": "us-west1-c", "status": "online"},
+    {"id": "gcp-africa-south1-za-1", "country_code": "ZA", "country": "South Africa", "city": "africa-south1-a", "status": "online"},
+    {"id": "gcp-africa-south1-za-2", "country_code": "ZA", "country": "South Africa", "city": "africa-south1-b", "status": "online"},
+]
+
 
 # ---------------------------------------------------------------------------
 # 异常定义
@@ -177,78 +224,81 @@ def _keccak_256(data: bytes) -> bytes:
             state[0][0] ^= RC[round_idx]
 
     out = bytearray()
-    for y in range(5):
-        for x in range(5):
-            out.extend(state[x][y].to_bytes(8, 'little'))
-            if len(out) >= 32:
-                return bytes(out[:32])
+    for i in range(4):
+        val = state[i % 5][i // 5]
+        out.extend(val.to_bytes(8, 'little'))
+    return bytes(out)
 
-# 2. Secp256k1 椭圆曲线与以太坊地址/签名
+# 2. Secp256k1
 _SECP_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-_SECP_Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
-_SECP_Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
-_SECP_G = (_SECP_Gx, _SECP_Gy)
 _SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_SECP_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+)
 
-def _secp_inv(k, p):
-    return pow(k, p - 2, p)
-
-def _secp_point_add(p1, p2):
+def _point_add(p1, p2):
     if p1 is None: return p2
     if p2 is None: return p1
     x1, y1 = p1
     x2, y2 = p2
     if x1 == x2 and y1 != y2: return None
     if x1 == x2:
-        m = (3 * x1 * x1) * _secp_inv(2 * y1, _SECP_P) % _SECP_P
+        m = (3 * x1 * x1 * pow(2 * y1, _SECP_P - 2, _SECP_P)) % _SECP_P
     else:
-        m = (y2 - y1) * _secp_inv(x2 - x1, _SECP_P) % _SECP_P
+        m = ((y2 - y1) * pow(x2 - x1, _SECP_P - 2, _SECP_P)) % _SECP_P
     x3 = (m * m - x1 - x2) % _SECP_P
     y3 = (m * (x1 - x3) - y1) % _SECP_P
     return (x3, y3)
 
-def _secp_point_mul(k, p):
+def _point_mul(p, k):
     res = None
-    cur = p
-    while k > 0:
-        if k & 1: res = _secp_point_add(res, cur)
-        cur = _secp_point_add(cur, cur)
+    curr = p
+    while k:
+        if k & 1:
+            res = _point_add(res, curr)
+        curr = _point_add(curr, curr)
         k >>= 1
     return res
 
-def _pure_private_key_to_address(privkey_bytes: bytes) -> str:
-    d = int.from_bytes(privkey_bytes, 'big')
-    pub = _secp_point_mul(d, _SECP_G)
-    pub_bytes = pub[0].to_bytes(32, 'big') + pub[1].to_bytes(32, 'big')
-    addr_hex = _keccak_256(pub_bytes)[12:].hex().lower()
-    h = _keccak_256(addr_hex.encode('ascii')).hex()
-    res = [c.upper() if int(h[i], 16) >= 8 else c for i, c in enumerate(addr_hex)]
-    return '0x' + ''.join(res)
+def _pure_private_key_to_address(priv_bytes) -> str:
+    if isinstance(priv_bytes, str):
+        raw_hex = priv_bytes[2:] if priv_bytes.startswith('0x') else priv_bytes
+        priv_bytes = bytes.fromhex(raw_hex)
+    k = int.from_bytes(priv_bytes, 'big')
+    if not (1 <= k < _SECP_N):
+        raise ValueError("Invalid private key")
+    pt = _point_mul(_SECP_G, k)
+    pub_uncompressed = pt[0].to_bytes(32, 'big') + pt[1].to_bytes(32, 'big')
+    addr_hash = _keccak_256(pub_uncompressed)
+    return '0x' + addr_hash[12:].hex()
 
-def _pure_sign_personal_message(privkey_hex: str, message_str: str) -> str:
-    raw_hex = privkey_hex[2:] if privkey_hex.startswith('0x') else privkey_hex
-    privkey_bytes = bytes.fromhex(raw_hex)
-    msg_bytes = message_str.encode('utf-8')
-    prefix = f'\x19Ethereum Signed Message:\n{len(msg_bytes)}'.encode('ascii')
-    z = int.from_bytes(_keccak_256(prefix + msg_bytes), 'big')
-    d = int.from_bytes(privkey_bytes, 'big')
+def _pure_sign_personal_message(priv_bytes, message: str) -> str:
+    if isinstance(priv_bytes, str):
+        raw_hex = priv_bytes[2:] if priv_bytes.startswith('0x') else priv_bytes
+        priv_bytes = bytes.fromhex(raw_hex)
+    msg_bytes = message.encode('utf-8')
+    prefix = f"\x19Ethereum Signed Message:\n{len(msg_bytes)}".encode('utf-8')
+    h = _keccak_256(prefix + msg_bytes)
+    e = int.from_bytes(h, 'big')
+    d = int.from_bytes(priv_bytes, 'big')
 
-    while True:
-        k = random.SystemRandom().randint(1, _SECP_N - 1)
-        r_point = _secp_point_mul(k, _SECP_G)
-        r = r_point[0] % _SECP_N
-        if r == 0: continue
-        s = (_secp_inv(k, _SECP_N) * (z + r * d)) % _SECP_N
-        if s == 0: continue
-        v = 27 + (r_point[1] % 2)
-        if s > _SECP_N // 2:
-            s = _SECP_N - s
-            v = 27 + (1 - (r_point[1] % 2))
-        break
+    k_seed = _keccak_256(priv_bytes + h)
+    k = (int.from_bytes(k_seed, 'big') % (_SECP_N - 1)) + 1
+
+    pt = _point_mul(_SECP_G, k)
+    r = pt[0] % _SECP_N
+    s = (pow(k, _SECP_N - 2, _SECP_N) * (e + r * d)) % _SECP_N
+    recid = pt[1] & 1
+    if s > _SECP_N // 2:
+        s = _SECP_N - s
+        recid ^= 1
+    v = 27 + recid
 
     return '0x' + r.to_bytes(32, 'big').hex() + s.to_bytes(32, 'big').hex() + bytes([v]).hex()
 
-# 3. 纯 Python AES-256-GCM 解密
+
+# 3. AES-256-GCM
 _AES_SBOX = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -267,64 +317,55 @@ _AES_SBOX = [
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
 ]
-_AES_RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+_RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
 
 def _aes_key_expansion(key: bytes):
     nk = len(key) // 4
     nr = nk + 6
-    w = [[key[4*i], key[4*i+1], key[4*i+2], key[4*i+3]] for i in range(nk)]
-    for i in range(nk, 4 * (nr + 1)):
-        temp = list(w[i - 1])
+    w = list(key)
+    i = nk
+    while i < 4 * (nr + 1):
+        temp = w[(i - 1) * 4: i * 4]
         if i % nk == 0:
-            temp = temp[1:] + temp[:1]
+            temp = [_AES_SBOX[temp[1]], _AES_SBOX[temp[2]], _AES_SBOX[temp[3]], _AES_SBOX[temp[0]]]
+            temp[0] ^= _RCON[i // nk]
+        elif nk > 6 and i % nk == 4:
             temp = [_AES_SBOX[b] for b in temp]
-            temp[0] ^= _AES_RCON[i // nk]
-        elif nk > 6 and (i % nk == 4):
-            temp = [_AES_SBOX[b] for b in temp]
-        w.append([a ^ b for a, b in zip(w[i - nk], temp)])
-    return w, nr
+        for j in range(4):
+            w.append(w[(i - nk) * 4 + j] ^ temp[j])
+        i += 1
+    return bytes(w), nr
 
-def _aes_xtime(a):
+def _xtime(a):
     return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1)
 
-def _aes_encrypt_block(block: bytes, w, nr: int) -> bytes:
-    state = [[block[r + 4*c] for c in range(4)] for r in range(4)]
-    for c in range(4):
-        for r in range(4):
-            state[r][c] ^= w[c][r]
-
-    for round_num in range(1, nr):
-        for r in range(4):
-            for c in range(4):
-                state[r][c] = _AES_SBOX[state[r][c]]
-        state[1] = state[1][1:] + state[1][:1]
-        state[2] = state[2][2:] + state[2][:2]
-        state[3] = state[3][3:] + state[3][:3]
-        for c in range(4):
-            s0, s1, s2, s3 = state[0][c], state[1][c], state[2][c], state[3][c]
-            state[0][c] = _aes_xtime(s0 ^ s1) ^ s1 ^ s2 ^ s3
-            state[1][c] = _aes_xtime(s1 ^ s2) ^ s2 ^ s3 ^ s0
-            state[2][c] = _aes_xtime(s2 ^ s3) ^ s3 ^ s0 ^ s1
-            state[3][c] = _aes_xtime(s3 ^ s0) ^ s0 ^ s1 ^ s2
-        for c in range(4):
-            for r in range(4):
-                state[r][c] ^= w[round_num * 4 + c][r]
-
-    for r in range(4):
-        for c in range(4):
-            state[r][c] = _AES_SBOX[state[r][c]]
-    state[1] = state[1][1:] + state[1][:1]
-    state[2] = state[2][2:] + state[2][:2]
-    state[3] = state[3][3:] + state[3][:3]
-    for c in range(4):
-        for r in range(4):
-            state[r][c] ^= w[nr * 4 + c][r]
-
-    out = bytearray(16)
-    for c in range(4):
-        for r in range(4):
-            out[r + 4*c] = state[r][c]
-    return bytes(out)
+def _aes_encrypt_block(block: bytes, w: bytes, nr: int) -> bytes:
+    state = list(block)
+    for i in range(16): state[i] ^= w[i]
+    for round_idx in range(1, nr):
+        state = [_AES_SBOX[b] for b in state]
+        s0, s4, s8, s12 = state[0], state[4], state[8], state[12]
+        s1, s5, s9, s13 = state[5], state[9], state[13], state[1]
+        s2, s6, s10, s14 = state[10], state[14], state[2], state[6]
+        s3, s7, s11, s15 = state[15], state[3], state[7], state[11]
+        for c, (r0, r1, r2, r3) in enumerate([(s0, s1, s2, s3), (s4, s5, s6, s7), (s8, s9, s10, s11), (s12, s13, s14, s15)]):
+            t = r0 ^ r1 ^ r2 ^ r3
+            state[c * 4] = r0 ^ t ^ _xtime(r0 ^ r1)
+            state[c * 4 + 1] = r1 ^ t ^ _xtime(r1 ^ r2)
+            state[c * 4 + 2] = r2 ^ t ^ _xtime(r2 ^ r3)
+            state[c * 4 + 3] = r3 ^ t ^ _xtime(r3 ^ r0)
+        round_key = w[round_idx * 16:(round_idx + 1) * 16]
+        for i in range(16): state[i] ^= round_key[i]
+    state = [_AES_SBOX[b] for b in state]
+    state = [
+        state[0], state[5], state[10], state[15],
+        state[4], state[9], state[14], state[3],
+        state[8], state[13], state[2], state[7],
+        state[12], state[1], state[6], state[11]
+    ]
+    round_key = w[nr * 16:(nr + 1) * 16]
+    for i in range(16): state[i] ^= round_key[i]
+    return bytes(state)
 
 def _ghash(h_bytes, data):
     h = int.from_bytes(h_bytes, 'big')
@@ -348,7 +389,7 @@ def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ct_and_tag: bytes, aad: byte
     if len(nonce) != 12:
         raise ValueError('Nonce 长度必须为 12 字节')
     if len(ct_and_tag) < 16:
-        raise ValueError('密文长度不足（缺少 Tag）')
+        raise ValueError('密文长度不足(缺少 Tag)')
     ct = ct_and_tag[:-16]
     expected_tag = ct_and_tag[-16:]
 
@@ -379,29 +420,25 @@ def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ct_and_tag: bytes, aad: byte
     return bytes(pt)
 
 # ---------------------------------------------------------------------------
-# 基础工具函数
+# 格式化与辅助函数
 # ---------------------------------------------------------------------------
 
 def b64d(s):
     s = s.replace('-', '+').replace('_', '/')
     return base64.b64decode(s + '=' * (-len(s) % 4))
 
-
 def country_code_from_node_id(node_id):
     m = re.search(r'-([a-z]{2})-\d+$', node_id or '')
     return m.group(1).upper() if m else None
 
-
 def get_default_download_dir():
-    """获取系统默认下载目录（安卓上自动使用 /sdcard/Download，电脑上使用用户下载文件夹）"""
-    # 1. Windows 平台
+    """获取系统默认下载目录（安卓上自动使用 /sdcard/Download）"""
     if os.name == 'nt':
         win_dl = os.path.join(os.path.expanduser('~'), 'Downloads')
         if os.path.isdir(win_dl):
             return win_dl
         return BASE_DIR
 
-    # 2. Android (Termux) 平台优先检测
     android_paths = [
         '/sdcard/Download',
         '/storage/emulated/0/Download',
@@ -411,7 +448,6 @@ def get_default_download_dir():
         if os.path.isdir(p) and os.access(p, os.W_OK):
             return p
 
-    # 尝试创建 /sdcard/Download
     for parent in ['/sdcard', '/storage/emulated/0']:
         if os.path.isdir(parent):
             target = os.path.join(parent, 'Download')
@@ -422,14 +458,11 @@ def get_default_download_dir():
             except Exception:
                 pass
 
-    # 3. Linux / macOS 桌面平台
     user_dl = os.path.join(os.path.expanduser('~'), 'Downloads')
     if os.path.isdir(user_dl) and os.access(user_dl, os.W_OK):
         return user_dl
 
-    # 4. 回退到脚本自身所在目录
     return BASE_DIR
-
 
 def write_json(path, obj):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -438,6 +471,17 @@ def write_json(path, obj):
         json.dump(obj, f, indent=2, ensure_ascii=False)
         f.write('\n')
     os.replace(tmp, path)
+
+def is_ipv4(addr):
+    if not addr or not isinstance(addr, str):
+        return False
+    parts = addr.strip().split('.')
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or not (0 <= int(p) <= 255):
+            return False
+    return True
 
 # ---------------------------------------------------------------------------
 # 网络客户端
@@ -476,41 +520,44 @@ class IpowClient:
             resp_headers = r.headers
             resp_text = r.text
         else:
-            headers = {
+            req_headers = {
                 'User-Agent': USER_AGENT,
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
             }
             if token:
-                headers['Authorization'] = 'Bearer ' + token
-            data = json.dumps(body).encode('utf-8') if body is not None else None
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                req_headers['Authorization'] = 'Bearer ' + token
+            data_bytes = json.dumps(body).encode('utf-8') if body else None
+            req = urllib.request.Request(url, data=data_bytes, headers=req_headers,
+                                         method=method)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout, context=self.ssl_ctx) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout,
+                                            context=self.ssl_ctx) as resp:
                     status_code = resp.status
                     resp_headers = resp.headers
-                    resp_text = resp.read().decode('utf-8', errors='replace')
+                    resp_text = resp.read().decode('utf-8', 'replace')
             except urllib.error.HTTPError as err:
                 status_code = err.code
                 resp_headers = err.headers
-                resp_text = err.read().decode('utf-8', errors='replace')
+                resp_text = err.read().decode('utf-8', 'replace')
             except Exception as err:
-                raise IpowError(f'网络请求失败 ({method} {path}): {err}')
+                raise IpowError('网络请求失败: {}'.format(err))
 
         if self.verbose:
             print('  <- {} {}'.format(status_code, resp_text[:160]))
 
         if status_code == 429:
-            raw = resp_headers.get('Retry-After') or resp_headers.get('retry-after')
+            raw = (resp_headers.get('Retry-After')
+                   or resp_headers.get('retry-after') if resp_headers else None)
             try:
                 retry_after = int(float(raw))
             except (TypeError, ValueError):
-                retry_after = 30
+                retry_after = 200
             raise RateLimited(retry_after, resp_text[:120])
-        if status_code == 401:
-            raise IpowError('JWT 已失效 (401)')
+
         if status_code == 402:
             raise QuotaExhausted(resp_text[:160])
+
         if status_code >= 400:
             code = None
             try:
@@ -572,7 +619,6 @@ def node_name(node):
     return "iPoW-{}-{}{}".format(node.get('country_code', 'XX'),
                                  node['node_id'], node.get('name_suffix', ''))
 
-
 def build_vless_url(node):
     name = node_name(node)
     fp = node.get('fingerprint') or DEFAULT_FINGERPRINT
@@ -589,33 +635,38 @@ def build_vless_url(node):
     return 'vless://{}@{}:{}?{}#{}'.format(
         node['uuid'], node['server'], node['port'], '&'.join(parts), name)
 
-
 def build_hy2_url(node):
-    """hysteria2:// 链接（参数对齐官方订阅下发的 sing-box 配置）。"""
     hy2 = node.get('hy2') or {}
     server = hy2.get('server') or node['server']
     port = hy2.get('server_port') or node['port']
-    query = '?sni={}'.format(urllib.parse.quote(str(hy2['sni']))) \
-        if hy2.get('sni') else ''
+    sni = hy2.get('sni') or ''
+    if is_ipv4(sni):
+        sni = ''
+    params = ['insecure=1']
+    if sni:
+        params.append('sni=' + urllib.parse.quote(str(sni)))
+    query = '?' + '&'.join(params) if params else ''
     return 'hysteria2://{}@{}:{}/{}#{}'.format(
         hy2.get('password') or '', server, port, query, node_name(node))
 
-
 def build_clash_yaml(nodes):
     lines = [
-        '# Clash Meta / Mihomo Proxies Configuration',
+        '# Clash Meta / Mihomo Proxies Configuration (100% Live Dynamic IPs)',
         'proxies:',
     ]
     for n in nodes:
         lines.append("  - name: '{}'".format(node_name(n)))
         if n.get('protocol') == 'hysteria2':
             hy2 = n.get('hy2') or {}
+            server = hy2.get('server') or n['server']
             lines.append('    type: hysteria2')
-            lines.append('    server: {}'.format(hy2.get('server') or n['server']))
+            lines.append('    server: {}'.format(server))
             lines.append('    port: {}'.format(hy2.get('server_port') or n['port']))
             lines.append('    password: {}'.format(hy2.get('password') or ''))
-            if hy2.get('sni'):
-                lines.append('    sni: {}'.format(hy2['sni']))
+            sni = hy2.get('sni') or ''
+            if sni and not is_ipv4(sni):
+                lines.append('    sni: {}'.format(sni))
+            lines.append('    skip-cert-verify: true')
             lines.append('    udp: true')
             continue
         lines.append('    type: vless')
@@ -635,22 +686,23 @@ def build_clash_yaml(nodes):
         lines.append("      short-id: '{}'".format(n['short_id']))
     return '\n'.join(lines)
 
-
 def build_singbox_json(nodes):
     outbounds = []
     for n in nodes:
         if n.get('protocol') == 'hysteria2':
             hy2 = n.get('hy2') or {}
+            server = hy2.get('server') or n['server']
+            sni = hy2.get('sni') or ''
+            tls_dict = {'enabled': True, 'insecure': True}
+            if sni and not is_ipv4(sni):
+                tls_dict['server_name'] = sni
             outbounds.append({
                 'type': 'hysteria2',
                 'tag': node_name(n),
-                'server': hy2.get('server') or n['server'],
+                'server': server,
                 'server_port': hy2.get('server_port') or n['port'],
                 'password': hy2.get('password') or '',
-                'tls': {
-                    'enabled': True,
-                    **({'server_name': hy2['sni']} if hy2.get('sni') else {}),
-                },
+                'tls': tls_dict,
             })
             continue
         outbounds.append({
@@ -677,23 +729,50 @@ def build_singbox_json(nodes):
         })
     return {'outbounds': outbounds}
 
+def deduplicate_physical_nodes(nodes):
+    by_id = {}
+    for n in nodes:
+        nid = n.get('node_id')
+        if not nid:
+            continue
+        if nid not in by_id:
+            base = dict(n)
+            base.pop('name_suffix', None)
+            base.pop('protocol', None)
+            base.pop('flow', None)
+            base.pop('vless_url', None)
+            base.pop('hy2_url', None)
+            by_id[nid] = base
+        else:
+            base = by_id[nid]
+            if n.get('hy2') and not base.get('hy2'):
+                base['hy2'] = n['hy2']
+            if is_ipv4(n.get('server')) and not is_ipv4(base.get('server')):
+                base['server'] = n['server']
+    return list(by_id.values())
 
-def expand_protocol_variants(nodes):
-    """把每个物理节点拆成多条出站配置：
-
-    - `vless-reality`（xtls-rprx-vision 流控）与 `vless-reality:no-flow`
-      共用同一套 server/port/uuid/pbk/sid，仅 flow 与名字不同，本地直接派生；
-    - 订阅路径拉到的节点还带 `hy2` 字段时，额外追加一条 hysteria2 出站。
-    """
+def expand_protocol_variants(nodes, with_vision=False):
+    nodes = deduplicate_physical_nodes(nodes)
     expanded = []
     for n in nodes:
-        for proto, flow, suffix in PROTOCOL_VARIANTS:
-            v = dict(n)
-            v['protocol'] = proto
-            v['flow'] = flow
-            v['name_suffix'] = suffix
-            v['vless_url'] = build_vless_url(v)
-            expanded.append(v)
+        # 1. 官方原生标准 VLESS Reality (无流控，100% 官方服务端兼容)
+        v = dict(n)
+        v['protocol'] = 'vless-reality:no-flow'
+        v['flow'] = ''
+        v['name_suffix'] = ''
+        v['vless_url'] = build_vless_url(v)
+        expanded.append(v)
+
+        # 2. 仅在明确开启时才生成带 xtls-rprx-vision 流控变种
+        if with_vision:
+            v_vis = dict(n)
+            v_vis['protocol'] = 'vless-reality'
+            v_vis['flow'] = FLOW_VISION
+            v_vis['name_suffix'] = '-reality'
+            v_vis['vless_url'] = build_vless_url(v_vis)
+            expanded.append(v_vis)
+
+        # 3. 官方 Hysteria2 节点
         if n.get('hy2') and (n['hy2'] or {}).get('password'):
             v = dict(n)
             v['protocol'] = 'hysteria2'
@@ -704,10 +783,9 @@ def expand_protocol_variants(nodes):
             expanded.append(v)
     return expanded
 
-
-def write_configs(nodes, work_dir, quiet=False):
+def write_configs(nodes, work_dir, with_vision=False, quiet=False):
     os.makedirs(work_dir, exist_ok=True)
-    nodes = expand_protocol_variants(nodes)
+    nodes = expand_protocol_variants(nodes, with_vision=with_vision)
     paths = {
         'json': os.path.join(work_dir, MERGED_NODES_FILE),
         'vless': os.path.join(work_dir, 'all_nodes_vless.txt'),
@@ -731,12 +809,11 @@ def write_configs(nodes, work_dir, quiet=False):
                             ensure_ascii=False) + '\n')
     if not quiet:
         print('\n' + '=' * 60)
-        print('🎉 节点配置已成功生成到:')
+        print('🎉 100% 实时真实 IP 节点配置已成功生成:')
         for k, p in paths.items():
             print('  {:8s} -> {}'.format(k.upper(), p))
         print('=' * 60)
     return paths
-
 
 def decrypt_profile(resp):
     ep = resp.get('encrypted_profile')
@@ -758,7 +835,6 @@ def decrypt_profile(resp):
         plaintext = _pure_aes_gcm_decrypt(key_bytes, nonce_bytes, ct_bytes, b'')
 
     return json.loads(plaintext.decode('utf-8', errors='replace'))
-
 
 def node_from_capability(resp):
     profile = decrypt_profile(resp)
@@ -801,7 +877,6 @@ def generate_wallet():
     address = _pure_private_key_to_address(priv)
     return '0x' + priv.hex(), address
 
-
 def sign_login_message(pk, message):
     if _HAS_ETH_ACCOUNT:
         account = Account.from_key(pk)
@@ -809,15 +884,12 @@ def sign_login_message(pk, message):
         return '0x' + bytes(signed.signature).hex()
     return _pure_sign_personal_message(pk, message)
 
-
 def random_device_id():
     return ''.join(random.choices('0123456789abcdef', k=16))
-
 
 def random_device_name():
     brands = ['Xiaomi', 'Redmi', 'Huawei', 'Honor', 'Samsung', 'Vivo', 'iQOO', 'Oppo', 'OnePlus']
     return '{} {}'.format(random.choice(brands), random.randint(1000, 9999))
-
 
 def register_new_wallet(client, verbose=False):
     pk, address = generate_wallet()
@@ -861,92 +933,70 @@ def register_new_wallet(client, verbose=False):
 
     return state
 
-# ---------------------------------------------------------------------------
-# 从单个钱包拉取节点
-# ---------------------------------------------------------------------------
-
-def pull_with_wallet(client, state, session_id, device_id, args, remaining_ids):
-    nodes = []
-    pulled = []
-    unusable = set()
-    token = state['jwt']
-    sub_token = state.get('subscription_token')
-
-    batch = remaining_ids[:args.batch_size]
-    total = len(batch)
-    print(f'  逐个拉取 {total} 个节点...')
-
-    for idx, (node_id, country) in enumerate(batch):
-        if idx:
-            time.sleep(args.interval)
-
-        print(f'    [{idx+1}/{total}] {node_id} ...', end=' ', flush=True)
-
+def get_custom_state(args):
+    if args.state_file and os.path.exists(args.state_file):
         try:
-            resp = client.capability(
-                token, session_id, country, sub_token, device_id,
-                node_id=node_id)
-        except RateLimited as exc:
-            print(f'429 限流! (需等待 {exc.retry_after}s) → 自动换号')
-            return nodes, True, pulled, unusable
-        except QuotaExhausted:
-            print('402 配额耗尽! → 自动换号')
-            return nodes, True, pulled, unusable
-        except IpowError as exc:
-            code = getattr(exc, 'code', None)
-            if code in ('p2p_dht_capability_unavailable',
-                        'p2p_lite_country_mismatch'):
-                print('暂不可用（跳过）')
-                unusable.add(node_id)
-            else:
-                print(f'失败: {exc}')
-                unusable.add(node_id)
-            continue
-
-        got = resp.get('selected_node_id') or resp.get('node_id')
-        if got != node_id:
-            print(f'未命中({got})')
-            unusable.add(node_id)
-            continue
-
-        try:
-            node = node_from_capability(resp)
-        except IpowError as exc:
-            print(f'解密失败: {exc}')
-            unusable.add(node_id)
-            continue
-
-        nodes.append(node)
-        pulled.append((node_id, country))
-        print(f'{node["server"]} | {node.get("latency_ms", "-")}ms')
-
-    return nodes, False, pulled, unusable
+            with open(args.state_file, 'r', encoding='utf-8') as f:
+                st = json.load(f)
+                if isinstance(st, list) and st:
+                    st = st[0]
+                jwt_val = st.get('jwt') or st.get('jwt_token')
+                if jwt_val:
+                    return {
+                        'jwt': jwt_val,
+                        'subscription_url': st.get('subscription_url') or args.sub_url,
+                        'subscription_token': st.get('subscription_token'),
+                        'device_id': st.get('device_id') or random_device_id(),
+                        'device_name': st.get('device_name') or random_device_name(),
+                        'address': st.get('address', 'custom_user'),
+                        'user_id': st.get('user_id', 'custom_user')
+                    }
+        except Exception as e:
+            if args.verbose:
+                print(f"读取 state-file 失败: {e}")
+    if args.token or args.sub_url:
+        sub_tok = None
+        if args.sub_url:
+            sub_tok = args.sub_url.rstrip('/').split('/')[-1]
+        return {
+            'jwt': args.token,
+            'subscription_url': args.sub_url,
+            'subscription_token': sub_tok,
+            'device_id': random_device_id(),
+            'device_name': random_device_name(),
+            'address': 'custom_user',
+            'user_id': 'custom_user'
+        }
+    return None
 
 # ---------------------------------------------------------------------------
-# 订阅快速路径：按国家一次拉回全部节点（含 hysteria2）
+# 实时真 IP 抓取核心逻辑 (零硬编码)
 # ---------------------------------------------------------------------------
 
-def _sub_get(url, timeout=20):
-    """GET 订阅链接，返回 (status, text, headers)；网络层错误抛 IpowError。"""
-    req = urllib.request.Request(url, headers={
-        'User-Agent': SUB_USER_AGENT,
-        'Accept': '*/*',
-    })
+def _sub_get(url, timeout=20, attempts=3):
     try:
         ctx = ssl.create_default_context()
     except Exception:
         ctx = ssl._create_unverified_context()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return resp.status, resp.read().decode('utf-8', 'replace'), resp.headers
-    except urllib.error.HTTPError as err:
-        return (err.code, err.read().decode('utf-8', 'replace'), err.headers)
-    except Exception as err:
-        raise IpowError('订阅请求失败: {}'.format(err))
-
+    last_err = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        req = urllib.request.Request(url, headers={
+            'User-Agent': SUB_USER_AGENT,
+            'Accept': '*/*',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.status, resp.read().decode('utf-8', 'replace'), resp.headers
+        except urllib.error.HTTPError as err:
+            return (err.code, err.read().decode('utf-8', 'replace'), err.headers)
+        except Exception as err:
+            last_err = err
+            continue
+    raise IpowError('订阅请求失败(重试 {} 次): {}'.format(attempts, last_err))
 
 def _sub_get_json(url):
-    """拉订阅并映射错误码：429 -> RateLimited，402 -> QuotaExhausted。"""
     status, text, headers = _sub_get(url)
     if status == 429:
         raw = headers.get('Retry-After') or headers.get('retry-after') if headers else None
@@ -957,397 +1007,337 @@ def _sub_get_json(url):
         raise RateLimited(retry_after, text[:120])
     if status == 402:
         raise QuotaExhausted(text[:160])
-    if status == 401:
-        raise IpowError('订阅 JWT 失效 (401)')
     if status >= 400:
-        code = None
-        try:
-            code = (json.loads(text).get('error') or {}).get('code')
-        except Exception:
-            pass
-        raise IpowError('HTTP {} 订阅: {}'.format(status, text[:300]), code=code)
+        raise IpowError('HTTP {} 订阅: {}'.format(status, text[:300]))
     try:
         return json.loads(text)
     except Exception:
         raise IpowError('订阅响应不是 JSON: ' + text[:200])
 
-
-def nodes_from_subscription(cfg, want_ids, cat_by_id):
-    """把订阅 sing-box 配置解析成节点记录（vless 凭据 + hysteria2 密码）。"""
-    recs = {}
-    for o in cfg.get('outbounds') or []:
-        typ = o.get('type')
-        tag = o.get('tag') or ''
-        if typ == 'vless' and tag.endswith('-reality-android-noflow'):
-            nid = tag[:-len('-reality-android-noflow')]
-            tls = o.get('tls') or {}
-            reality = tls.get('reality') or {}
-            rec = recs.setdefault(nid, {'node_id': nid})
-            rec.update(server=o.get('server'), port=o.get('server_port'),
-                       uuid=o.get('uuid'), sni=tls.get('server_name'),
-                       public_key=reality.get('public_key'),
-                       short_id=reality.get('short_id'))
-        elif typ == 'hysteria2' and tag.endswith('-hy2'):
-            nid = tag[:-len('-hy2')]
-            tls = o.get('tls') or {}
-            rec = recs.setdefault(nid, {'node_id': nid})
-            rec['hy2'] = {'password': o.get('password'),
-                          'server': o.get('server'),
-                          'server_port': o.get('server_port'),
-                          'sni': tls.get('server_name')}
-
-    nodes = []
-    for nid, rec in recs.items():
-        if nid not in want_ids:
-            continue
-        # vless 凭据不全的丢给 capability 兜底
-        if not all(rec.get(k) for k in
-                   ('server', 'port', 'uuid', 'public_key', 'short_id')):
-            continue
-        entry = cat_by_id.get(nid) or {}
-        node = {
-            'node_id': nid,
-            'country': entry.get('country'),
-            'country_code': entry.get('country_code')
-                            or country_code_from_node_id(nid),
-            'city': entry.get('city'),
-            'region': entry.get('region'),
-            'latency_ms': entry.get('latency_ms'),
-            'server': rec['server'],
-            'port': rec['port'],
-            'uuid': rec['uuid'],
-            'sni': rec['sni'],
-            'public_key': rec['public_key'],
-            'short_id': rec['short_id'],
-            'hy2': rec.get('hy2'),
-            'vless_url': None,
-        }
-        node['vless_url'] = build_vless_url(node)
-        nodes.append(node)
-    return nodes
-
-
-def pull_via_subscription(client, state, session_id, args, remaining_ids,
-                          cat_by_id):
-    """按国家枚举订阅：每国 1 次请求拿回该国全部在线节点。
-
-    实测（2026-10-06）：全新会话、未做任何 capability 时，
-    GET sub.ipow.ai/sub/<token>?session_id=&country=CC 即返回该国全部节点的
-    sing-box 配置（vless-reality:no-flow + hysteria2），23 国 47 节点 ≈ 30s、
-    零配额消耗；而逐节点 capability 拉到 25 个就会撞 429。
-    返回 (nodes, rate_limited, pulled, unusable)，语义同 pull_with_wallet；
-    某国失败不标记 unusable，留给 capability 兜底。
-    """
-    nodes, pulled, unusable = [], [], set()
+def pull_live_hy2_from_subscription(client, state, session_id, ccs, cat_by_id, interval=0.5):
+    """从官方订阅实时抓取全部 Hysteria2 真实落地 IP（100% 动态，无硬编码）"""
+    hy2_nodes = []
     sub_url = state.get('subscription_url')
     if not sub_url and state.get('subscription_token'):
         sub_url = 'https://sub.ipow.ai/sub/' + state['subscription_token']
     if not sub_url:
-        raise IpowError('状态里没有订阅链接/token')
+        return hy2_nodes
 
-    by_cc = {}
-    for nid, cc in remaining_ids:
-        by_cc.setdefault(cc or 'AUTO', []).append(nid)
-    ccs = sorted(by_cc)
-    print(f'  订阅拉取: {len(ccs)} 个国家/地区，{len(remaining_ids)} 个节点...')
-
-    for i, cc in enumerate(ccs):
-        if i:
-            time.sleep(args.interval)
-        want = set(by_cc[cc])
-        print(f'    [{i+1}/{len(ccs)}] {cc}: {len(want)} 个 ...', end=' ', flush=True)
+    print(f'正在从官方订阅实时提取 Hysteria2 落地 IP (共 {len(ccs)} 个国家/地区)...')
+    for idx, cc in enumerate(ccs):
+        if idx:
+            time.sleep(interval)
+        print(f'  [{idx+1}/{len(ccs)}] {cc} ...', end=' ', flush=True)
         url = '{}?session_id={}&country={}'.format(
             sub_url, urllib.parse.quote(str(session_id)),
             urllib.parse.quote(str(cc)))
         try:
             cfg = _sub_get_json(url)
-        except RateLimited as exc:
-            print(f'429 限流! (需等待 {exc.retry_after}s) → 自动换号')
-            return nodes, True, pulled, unusable
-        except QuotaExhausted:
-            print('402 配额耗尽! → 自动换号')
-            return nodes, True, pulled, unusable
-        except IpowError as exc:
-            print(f'失败: {exc}')
+        except Exception as exc:
+            print(f'跳过: {exc}')
             continue
 
-        got = nodes_from_subscription(cfg, want, cat_by_id)
-        found = {n['node_id'] for n in got}
-        nodes.extend(got)
-        pulled.extend((nid, cc) for nid in found)
-        missing = want - found
-        print(f'{len(found)}/{len(want)} 个'
-              + (f'（{len(missing)} 个未下发，留给 capability）' if missing else ' ✓'))
+        count = 0
+        for o in cfg.get('outbounds') or []:
+            typ = o.get('type')
+            tag = o.get('tag') or ''
+            if typ == 'hysteria2' and tag.endswith('-hy2'):
+                nid = tag[:-len('-hy2')]
+                tls = o.get('tls') or {}
+                # 订阅下发的 tls.server_name 是官方当期物理落地真 IP
+                live_ip = tls.get('server_name') or ''
+                if is_ipv4(live_ip):
+                    entry = cat_by_id.get(nid) or {}
+                    hy2_nodes.append({
+                        'node_id': nid,
+                        'country': entry.get('country'),
+                        'country_code': entry.get('country_code') or country_code_from_node_id(nid),
+                        'city': entry.get('city'),
+                        'region': entry.get('region'),
+                        'latency_ms': entry.get('latency_ms'),
+                        'server': live_ip,
+                        'port': o.get('server_port') or 443,
+                        'uuid': '',
+                        'public_key': '',
+                        'short_id': '',
+                        'hy2': {
+                            'password': o.get('password') or '',
+                            'server': live_ip,
+                            'server_port': o.get('server_port') or 443,
+                            'sni': '',
+                        }
+                    })
+                    count += 1
+        print(f'{count} 个真 IP ✓')
+    return hy2_nodes
 
-    return nodes, False, pulled, unusable
+def pull_live_vless_from_dht(client, state, session_id, remaining_ids, interval=0.5):
+    """从官方 DHT capability 实时解密全部 VLESS 真实落地 IP（100% 动态，无硬编码）"""
+    vless_nodes = []
+    pulled = []
+    unusable = set()
+    token = state['jwt']
+    sub_token = state.get('subscription_token')
+    device_id = state['device_id']
 
-# ---------------------------------------------------------------------------
-# 合并去重
-# ---------------------------------------------------------------------------
+    total = len(remaining_ids)
+    print(f'正在从官方 DHT 实时解密 VLESS 落地 IP (待解密 {total} 个)...')
+
+    for idx, (node_id, country) in enumerate(remaining_ids):
+        if idx:
+            time.sleep(interval)
+        print(f'  [{idx+1}/{total}] {node_id} ...', end=' ', flush=True)
+
+        try:
+            resp = client.capability(token, session_id, country, sub_token, device_id, node_id=node_id)
+        except RateLimited as exc:
+            print(f'429 限流! (需等待 {exc.retry_after}s) → 自动换号')
+            return vless_nodes, True, pulled, unusable
+        except QuotaExhausted:
+            print('402 配额耗尽! → 自动换号')
+            return vless_nodes, True, pulled, unusable
+        except IpowError as exc:
+            code = getattr(exc, 'code', None)
+            if code in ('p2p_dht_capability_unavailable', 'p2p_lite_country_mismatch'):
+                print('暂不可用（跳过）')
+                unusable.add(node_id)
+            else:
+                print(f'失败: {exc}')
+                unusable.add(node_id)
+            continue
+
+        try:
+            node = node_from_capability(resp)
+        except IpowError as exc:
+            print(f'解密失败: {exc}')
+            unusable.add(node_id)
+            continue
+
+        vless_nodes.append(node)
+        pulled.append((node_id, country))
+        print(f'{node["server"]} (真实落地) | {node.get("latency_ms", "-")}ms')
+
+    return vless_nodes, False, pulled, unusable
 
 def merge_nodes(existing, new_nodes):
-    by_id = {n['node_id']: n for n in existing}
+    by_id = {n['node_id']: dict(n) for n in deduplicate_physical_nodes(existing)}
     added = 0
-    for n in new_nodes:
+    for n in deduplicate_physical_nodes(new_nodes):
         nid = n.get('node_id')
-        if nid and nid not in by_id:
+        if not nid:
+            continue
+        if nid not in by_id:
             added += 1
-        if nid:
-            by_id[nid] = n
+            by_id[nid] = dict(n)
+        else:
+            curr = by_id[nid]
+            for k, v in n.items():
+                if v is not None:
+                    if k == 'server' and not is_ipv4(v) and is_ipv4(curr.get('server')):
+                        continue
+                    curr[k] = v
+            if 'hy2' in n and n['hy2']:
+                curr['hy2'] = n['hy2']
+            if curr.get('uuid'):
+                curr['vless_url'] = build_vless_url(curr)
+            by_id[nid] = curr
     return list(by_id.values()), added
 
 # ---------------------------------------------------------------------------
-# 固定配置对象（替代原 argparse.Namespace）
+# 主流程入口
 # ---------------------------------------------------------------------------
 
-class _Args:
-    """从 CONFIG 派生的固定配置对象，替代原 argparse.Namespace。"""
-    def __init__(self, cfg):
-        self.interval = cfg['interval']
-        self.wallets = cfg['wallets']
-        self.limit = cfg['limit']
-        self.include_offline = cfg['include_offline']
-        self.via = cfg['via']
-        self.batch_size = cfg['batch_size']
-        self.base_url = cfg['base_url']
-        self.out_dir = cfg['out_dir']
-        self.verbose = cfg['verbose']
-        self.quiet = cfg['quiet']
-
-# ---------------------------------------------------------------------------
-# 主流程入口（无命令行参数）
-# ---------------------------------------------------------------------------
-
-def main():
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, 'reconfigure'):
-            stream.reconfigure(encoding='utf-8', errors='replace')
-
+def main(argv=None):
     default_dir = get_default_download_dir()
-    args = _Args(CONFIG)
+
+    ap = argparse.ArgumentParser(
+        prog='auto_fetch_live_nodes.py',
+        description='iPoW.ai 纯实时真 IP 拉取版：零硬编码 + 官方 DHT/订阅全动态获取')
+    ap.add_argument('--interval', type=float, default=0.5,
+                    help='请求间隔秒数，默认 %(default)s')
+    ap.add_argument('--wallets', type=int, default=10,
+                    help='最多使用多少个钱包轮换，默认 %(default)s')
+    ap.add_argument('--limit', type=int, default=None,
+                    help='限制拉取物理节点数（默认全部）')
+    ap.add_argument('--mode', choices=['all', 'vless', 'hy2'], default='all',
+                    help='拉取模式: all=VLESS+Hy2均实时解密真IP(默认), vless=仅VLESS, hy2=仅Hy2')
+    ap.add_argument('--no-merge', action='store_true',
+                    help='不合并历史全量已知节点库，仅拉取官方当前公开的节点（默认会自动合并保全 47~62 个全量物理机）')
+    ap.add_argument('--all-known', action='store_true',
+                    help='合并历史已知全量物理节点（兼容旧参数）')
+    ap.add_argument('--with-vision', action='store_true',
+                    help='同时生成 xtls-rprx-vision 流控变种（注意：官方服务端未开启该流控，通常不可用）')
+    ap.add_argument('--token', default=None,
+                    help='已有的有效账户 JWT Token（可选，跳过自动注册）')
+    ap.add_argument('--sub-url', default=None,
+                    help='已有的官方订阅 URL（可选，直接提取 Hysteria2 真 IP）')
+    ap.add_argument('--state-file', default=None,
+                    help='已有的凭据状态 JSON 文件（如 .ipow_state.json）')
+    ap.add_argument('--base-url', default=API_BASE,
+                    help='接口地址，默认 %(default)s')
+    ap.add_argument('-o', '--out-dir', default=default_dir,
+                    help='输出文件目录，默认保存在系统下载目录: %(default)s')
+    ap.add_argument('-v', '--verbose', action='store_true',
+                    help='详细输出')
+    ap.add_argument('--quiet', action='store_true',
+                    help='只输出最终结果')
+    args = ap.parse_args(argv)
 
     out_dir = os.path.abspath(args.out_dir) if args.out_dir else default_dir
-
-    # 检查并测试输出目录写入权限
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        test_perm_file = os.path.join(out_dir, '.perm_test')
-        with open(test_perm_file, 'w') as f:
-            f.write('ok')
-        os.remove(test_perm_file)
-    except Exception as exc:
-        print(f'⚠️ 提示: 默认输出目录不可写: {out_dir}')
-        if '/sdcard' in out_dir or 'storage' in out_dir:
-            print('💡 安卓 Termux 提示: 访问系统下载目录需要授权，可在 Termux 终端运行:')
-            print('   termux-setup-storage')
-            print('   并在系统弹窗中点击“允许”。')
-        out_dir = os.getcwd()
-        print(f'   已自动改用当前脚本工作目录: {out_dir}')
+    os.makedirs(out_dir, exist_ok=True)
 
     if not args.quiet:
         print('=' * 60)
-        print('  iPoW.ai 全量节点自动拉取 (Android 独立单文件版)')
+        print('  iPoW.ai 全自动实时真实 IP 拉取 (零硬编码 · Android 专版)')
         print('=' * 60)
-        engine_str = "内置纯 Python 引擎 (Termux 零依赖)" if not (_HAS_ETH_ACCOUNT and _HAS_CRYPTOGRAPHY) else "硬件加速引擎"
+        engine_str = "内置纯 Python 引擎 (Termux 零外部依赖)" if not (_HAS_ETH_ACCOUNT and _HAS_CRYPTOGRAPHY) else "硬件加速引擎"
         print(f'运行环境: {engine_str}')
         print(f'保存目录: {out_dir}')
         print('=' * 60)
 
     client = IpowClient(base=args.base_url, verbose=args.verbose)
 
-    all_nodes = []
-    seen_ids = set()
-    unusable_ids = set()
-
-    # 全量节点目录：/v1/nodes 返回全部 57 个物理节点（含 protocols/outbound_tags），
-    # 旧的 /p2p-lite/v1/nodes 只有 24 个推荐子集，已废弃。
-    print('正在获取全网节点目录 (/v1/nodes)...')
+    # 1. 获取全网物理节点目录
+    print(f'正在从官方接口获取在线物理节点 ({CATALOG_PATH})...')
     cat_body = client._request('GET', CATALOG_PATH)
-
     entries = cat_body.get('nodes') or cat_body.get('entries') or []
-    if not entries:
-        print('错误: 服务端未返回任何节点')
-        return 1
+    usable = [e for e in entries if e.get('status') == 'online']
 
-    offline_ids = [e for e in entries if e.get('status') != 'online']
-    incompat_ids = [e for e in entries
-                    if CAPABILITY not in (e.get('protocols') or [CAPABILITY])]
-    usable = [
-        e for e in entries
-        if (args.include_offline or e.get('status') == 'online')
-        and CAPABILITY in (e.get('protocols') or [CAPABILITY])
-    ]
-    cat_by_id = {e.get('id') or e.get('node_id'): e for e in entries}
-    skipped = len(entries) - len(usable)
+    online_count = len(usable)
+    if not args.no_merge:
+        existing_ids = {e.get('id') or e.get('node_id') for e in usable}
+        added_known = 0
+        for ke in KNOWN_PHYSICAL_NODES:
+            kid = ke.get('id') or ke.get('node_id')
+            if kid and kid not in existing_ids:
+                usable.append(dict(ke))
+                existing_ids.add(kid)
+                added_known += 1
+        if added_known:
+            print(f'💡 官方在线: {online_count} 个 | 自动合并全量节点库: +{added_known} 个 (总计 {len(usable)} 个物理机)')
 
+    cat_by_id = {e.get('id') or e.get('node_id'): e for e in usable}
     all_ids = [(e.get('id') or e.get('node_id'), e.get('country_code', 'AUTO'))
                for e in usable if e.get('id') or e.get('node_id')]
     target = args.limit or len(all_ids)
     remaining = all_ids[:target]
+    ccs = sorted({cc for _, cc in remaining if cc and cc != 'AUTO'})
 
-    reasons = []
-    if offline_ids and not args.include_offline:
-        reasons.append(f'{len(offline_ids)} 个服务端标记 offline')
-    if incompat_ids:
-        reasons.append(f'{len(incompat_ids)} 个不声明 {CAPABILITY}')
-    print(f'目录节点: {len(entries)} 个 | 在线可用: {len(usable)} 个 | 本次目标: {len(remaining)} 个')
-    if skipped:
-        detail = '、'.join(reasons) or f'{skipped} 个被过滤'
-        extra = ''
-        if offline_ids and not args.include_offline:
-            extra = '（offline 可在 CONFIG 里设置 include_offline=True 强制尝试）'
-        print(f'  已跳过 {skipped} 个: {detail}{extra}')
-        if args.verbose:
-            for e in offline_ids:
-                print(f'    offline: {e.get("id")}')
-            for e in incompat_ids:
-                print(f'    不兼容: {e.get("id")} protocols={e.get("protocols")}')
+    print(f'待扫描物理机: {len(usable)} 个 | 本次目标: {len(remaining)} 个 ({len(ccs)} 个地区)')
 
+    all_nodes = []
     wallets_used = []
-    no_progress = 0          # 连续零进展轮数（防死循环烧钱包）
+    unusable_ids = set()
+    custom_state = get_custom_state(args)
 
-    while remaining:
-        wallet_idx = len(wallets_used) + 1
-        print(f'\n{"─" * 50}')
-        print(f'钱包 #{wallet_idx} | 待拉取 {len(remaining)} 个节点')
-
-        # 1) 自动注册新钱包
+    # 第一步：若需要 Hy2，从官方订阅直接提取实时 Hysteria2 真实落地 IP
+    if args.mode in ('all', 'hy2'):
         try:
-            state = register_new_wallet(client, verbose=args.verbose)
-            wallets_used.append({
-                'address': state['address'],
-                'user_id': state['user_id'],
-                'plan_id': state['plan_id'],
-            })
-            print(f'  新钱包: {state["address"]} (用户: {state["user_id"]})')
-        except IpowError as exc:
-            print(f'  ❌ 注册失败: {exc}')
-            break
-        except Exception as exc:
-            print(f'  ❌ 注册异常: {exc}')
-            break
-
-        if len(wallets_used) > args.wallets:
-            print(f'\n已达钱包上限 {args.wallets}')
-            break
-
-        # 2) 开启会话
-        try:
-            token = state['jwt']
-            device_id = state['device_id']
-            device_name = state['device_name']
-            session = client.session_start(token, device_id, device_name)
-            session_id = (session.get('session') or {}).get('id')
-            if not session_id:
-                print('  ❌ sessions/start 无 session_id')
-                continue
-            if not args.quiet:
-                print(f'  建立会话: {session_id}')
-        except IpowError as exc:
-            print(f'  ❌ 开启会话失败: {exc}')
-            continue
-
-        # 3) 拉取节点：订阅快速路径优先，剩余走逐节点 capability 兜底
-        nodes, rate_limited, pulled = [], False, []
-        try:
-            if args.via in ('sub', 'auto') and state.get('subscription_url'):
-                n1, rl1, p1, u1 = pull_via_subscription(
-                    client, state, session_id, args, remaining, cat_by_id)
-                nodes += n1
-                pulled += p1
-                rate_limited = rate_limited or rl1
-                unusable_ids.update(u1)
-                got = {n.get('node_id') for n in n1}
-                remaining = [(nid, cc) for nid, cc in remaining
-                             if nid not in got and nid not in unusable_ids]
-            if remaining and args.via != 'sub':
-                # 即便订阅被 429，也用同一钱包尝试 capability（不同端点，配额独立）；
-                # 它自身若再 429 会立即返回，成本只有一次请求
-                n2, rl2, p2, u2 = pull_with_wallet(
-                    client, state, session_id, device_id, args, remaining)
-                nodes += n2
-                pulled += p2
-                rate_limited = rate_limited or rl2
-                unusable_ids.update(u2)
-            elif remaining and args.via == 'sub' and not rate_limited:
-                print(f'  ⚠️  订阅未覆盖 {len(remaining)} 个节点（via=sub 不回退）')
-        except Exception as exc:
-            print(f'  ❌ 拉取异常: {exc}')
-            continue
-
-        # 4) 合并去重与实时落盘
-        if nodes:
-            all_nodes, added = merge_nodes(all_nodes, nodes)
-            for n in nodes:
-                nid = n.get('node_id')
-                if nid:
-                    seen_ids.add(nid)
-
-            print(f'  ✅ 本批拉到 {len(nodes)} 个（总累计 {len(all_nodes)} 个）')
-            write_json(os.path.join(out_dir, MERGED_NODES_FILE), all_nodes)
-        else:
-            print('  ⚠️  本批未拉到可用节点')
-
-        # 过滤剩余节点（排除已成功的和已确认不可用的节点）
-        remaining = [(nid, cc) for nid, cc in remaining
-                     if nid not in seen_ids and nid not in unusable_ids]
-
-        # 5) 零进展计数（防死循环烧钱包，限流轮也算）
-        if nodes:
-            no_progress = 0
-        elif remaining:
-            no_progress += 1
-            if no_progress >= 2:
-                print(f'  ⛔ 连续 {no_progress} 轮零进展，停止拉取（剩余 {len(remaining)} 个）')
-                break
-
-        # 6) 429 限流或 402 配额耗尽时自动换钱包继续
-        if rate_limited:
-            if remaining:
-                print(f'  🔄 触发换号 → 自动注册新钱包继续拉取剩余 {len(remaining)} 个')
-                time.sleep(1)
-                continue
+            print('\n[阶段 1/2] 准备凭据并实时抓取 Hysteria2 真实 IP...')
+            if custom_state and (custom_state.get('subscription_url') or custom_state.get('jwt')):
+                s_init = custom_state
+                print(f"  使用传入凭证: {s_init.get('address')}")
             else:
+                s_init = register_new_wallet(client, verbose=args.verbose)
+                wallets_used.append(s_init['address'])
+
+            sid_init = None
+            if s_init.get('jwt'):
+                try:
+                    sess_init = client.session_start(s_init['jwt'], s_init['device_id'], s_init['device_name'])
+                    sid_init = (sess_init.get('session') or {}).get('id')
+                except Exception as exc:
+                    if args.verbose:
+                        print(f"  开启会话提示: {exc}")
+
+            hy2_nodes = pull_live_hy2_from_subscription(client, s_init, sid_init, ccs, cat_by_id, interval=args.interval)
+            all_nodes, _ = merge_nodes(all_nodes, hy2_nodes)
+            print(f'✅ 已成功提取 {len(hy2_nodes)} 个 Hysteria2 实时落地 IP')
+        except Exception as exc:
+            print(f'⚠️ Hysteria2 提取跳过: {exc} (将继续尝试 VLESS)')
+
+    # 第二步：若需要 VLESS，通过官方 DHT capability 实时解密真实落地 IP (多钱包自动续传)
+    if args.mode in ('all', 'vless'):
+        print('\n[阶段 2/2] 通过官方 DHT 接口实时解密 VLESS 真实落地 IP...')
+        while remaining:
+            wallet_idx = len(wallets_used) + 1
+            print(f'\n{"─" * 50}')
+            print(f'待解密 {len(remaining)} 个节点')
+
+            if custom_state and custom_state.get('jwt') and not wallets_used:
+                state = custom_state
+                wallets_used.append(state['address'])
+                print(f'  使用指定凭证: {state["address"]}')
+            else:
+                try:
+                    state = register_new_wallet(client, verbose=args.verbose)
+                    wallets_used.append(state['address'])
+                    print(f'  新钱包: {state["address"]} (用户: {state["user_id"]})')
+                except Exception as exc:
+                    print(f'  ❌ 注册失败: {exc}')
+                    break
+
+            if len(wallets_used) > args.wallets:
+                print(f'\n已达钱包轮换上限 {args.wallets}')
                 break
 
-        if remaining:
-            time.sleep(args.interval)
+            try:
+                session = client.session_start(state['jwt'], state['device_id'], state['device_name'])
+                session_id = (session.get('session') or {}).get('id')
+                if not session_id:
+                    print('  ❌ 会话建立无 session_id')
+                    continue
+            except QuotaExhausted as exc:
+                print(f'  ⚠️ 会话建立失败(402): {exc}')
+                print('  💡 官方当前状态：新注册钱包默认订阅未激活（Phase 1 计费模式）。')
+                print('  💡 若您持有有效账户或订阅链接，可通过参数直接解密:')
+                print('     python auto_fetch_live_nodes.py --token <您的JWT>')
+                print('     python auto_fetch_live_nodes.py --sub-url <您的订阅URL>')
+                break
+            except Exception as exc:
+                print(f'  ❌ 开启会话失败: {exc}')
+                continue
 
-    # 保存钱包记录
-    write_json(os.path.join(out_dir, WALLETS_FILE), wallets_used)
+            v_nodes, rate_limited, pulled, u2 = pull_live_vless_from_dht(
+                client, state, session_id, remaining, interval=args.interval)
 
-    # 写出全部配置文件
-    if all_nodes:
-        write_configs(all_nodes, out_dir, quiet=args.quiet)
+            unusable_ids.update(u2)
+            if v_nodes:
+                all_nodes, _ = merge_nodes(all_nodes, v_nodes)
+                print(f'  ✅ 本批解密 {len(v_nodes)} 个（总累计 {len(all_nodes)} 个物理节点）')
 
-    # 汇总输出
-    print(f'\n{"=" * 60}')
+            pulled_set = {nid for nid, _ in pulled}
+            remaining = [(nid, cc) for nid, cc in remaining
+                         if nid not in pulled_set and nid not in unusable_ids]
+
+    # 保存真 IP 映射并生成全套配置
+    live_ip_map = {
+        '_description': '100% dynamically resolved physical node IPs directly from official APIs',
+        'vless_ips': {n['node_id']: n['server'] for n in all_nodes if is_ipv4(n.get('server'))},
+        'hy2_ips': {n['node_id']: (n.get('hy2') or {}).get('server')
+                    for n in all_nodes if is_ipv4((n.get('hy2') or {}).get('server'))},
+    }
+    write_json(os.path.join(out_dir, IP_MAP_FILE), live_ip_map)
+
+    # 生成配置
+    paths = write_configs(all_nodes, out_dir, with_vision=args.with_vision, quiet=args.quiet)
+
+    expanded_nodes = expand_protocol_variants(all_nodes, with_vision=args.with_vision)
+    print('\n' + '=' * 60)
     print('【全网节点拉取汇总】')
     print(f'  使用钱包数: {len(wallets_used)} 个')
-    print(f'  物理节点数: {len(all_nodes)} 个')
-    if all_nodes:
-        hy2_count = sum(1 for n in all_nodes if n.get('hy2'))
-        total = (len(all_nodes) * len(PROTOCOL_VARIANTS) + hy2_count)
-        print(f'  拆分后配置数: {total} 条 '
-              f'(reality + no-flow × {len(all_nodes)}'
-              + (f' + hysteria2 × {hy2_count}' if hy2_count else '') + ')')
-
-    countries = {}
-    for n in all_nodes:
-        cc = n.get('country_code', '?')
-        countries[cc] = countries.get(cc, 0) + 1
-    if countries:
-        print(f'  覆盖国家/地区: {len(countries)} 个')
-        for cc in sorted(countries):
-            print(f'    - {cc}: {countries[cc]} 个节点')
-
+    print(f'  成功物理节点数: {len(all_nodes)} 个物理机')
+    print(f'  生成代理配置数: {len(expanded_nodes)} 个 (Reality + NoFlow + Hy2 展开)')
+    v_count = len([n for n in all_nodes if is_ipv4(n.get('server'))])
+    h_count = len([n for n in all_nodes if is_ipv4((n.get('hy2') or {}).get('server'))])
+    print(f'  真实 VLESS 物理节点: {v_count} 个')
+    print(f'  真实 Hysteria2 物理节点: {h_count} 个')
     print('=' * 60)
-    print(f'💡 安卓导入提示:')
-    print(f'  - v2rayNG: 复制 {os.path.join(out_dir, "all_nodes_vless.txt")} 内容，打开 App 选择“从剪贴板导入”')
-    print(f'  - Clash Meta: 打开 App 配置页面，直接选择导入本地文件 {os.path.join(out_dir, "clash_proxies.yaml")}')
+    print('💡 安卓导入提示:')
+    print(f'  - v2rayNG: 复制 {paths["vless"]} 内容，打开 App 选择“从剪贴板导入”')
+    print(f'  - Clash Meta: 打开 App 配置页面，直接选择导入本地文件 {paths["clash"]}')
     print('=' * 60)
     return 0
 
-
 if __name__ == '__main__':
-    raise SystemExit(main())
+    sys.exit(main())
